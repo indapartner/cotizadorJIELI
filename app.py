@@ -53,14 +53,13 @@ def obtener_candidatos_locales(detalle_cliente, df_precios, limite=15):
     return candidatos.head(limite)
 
 def buscar_con_ia(detalle_cliente, candidatos_df, api_key, provider):
-    """Le pregunta a DeepSeek cuál de los productos candidatos es el correcto"""
+    """Le pregunta a la IA con un sistema de puntuación estricto para evitar que invente"""
     if not api_key:
         return None
         
-    # Configuramos la URL del proveedor gratuito elegido
     if "Groq" in provider:
         base_url = "https://api.groq.com/openai/v1"
-        model_name = "llama-3.3-70b-versatile" # Modelo open-source ultra inteligente y gratis en Groq
+        model_name = "llama-3.3-70b-versatile"
     else:
         base_url = "https://api.deepseek.com/v1"
         model_name = "deepseek-chat"
@@ -68,47 +67,50 @@ def buscar_con_ia(detalle_cliente, candidatos_df, api_key, provider):
     try:
         client = OpenAI(api_key=api_key, base_url=base_url)
         
-        # Armamos una lista compacta de opciones para la IA
+        # Reducimos los candidatos a los 8 más viables para que no se maree
         opciones = ""
-        for _, fila in candidatos_df.iterrows():
-            opciones += f"CÓDIGO: {fila['codigo']} | DETALLE: {fila['detalle']}\n"
+        for _, fila in candidatos_df.head(8).iterrows():
+            opciones += f"- CÓDIGO: {fila['codigo']} | PRODUCTO: {fila['detalle']}\n"
             
         prompt = f"""
-        Actuás como un experto en materiales eléctricos de un mostrador de ventas mayorista.
-        Un cliente solicita este producto: "{detalle_cliente}"
+        Sos un experto en el mostrador de JIELI Materiales Eléctricos. Tu trabajo es hacer un match perfecto entre lo que pide el cliente y nuestro catálogo.
         
-        Comparalo contra estas opciones de nuestro catálogo oficial de la empresa:
+        PRODUCTO SOLICITADO POR EL CLIENTE: "{detalle_cliente}"
+        
+        OPCIONES DISPONIBLES EN NUESTRO CATÁLOGO:
         {opciones}
         
-        Elegí la mejor coincidencia. Si ninguna opción se parece en absoluto, respondé "NINGUNA".
-        Tu respuesta debe ser estrictamente un JSON con este formato, sin texto extra alrededor:
-        {{"codigo_elegido": "EL_CODIGO_AQUI"}}
+        REGLAS DE ORO:
+        1. Analizá las propiedades técnicas (Amperaje 'A', Milímetros 'mm', marcas, colores).
+        2. Si el producto del cliente menciona un color (ej. Rojo) o medida (ej. 2.5mm), la opción elegida DEBE tener esa misma característica. No cambies rojo por celeste.
+        3. Si considerás que NINGUNA opción coincide semánticamente en más de un 80%, respondé "NINGUNA". Es preferible no encontrarlo a sugerir algo incorrecto.
+        
+        Respondé EXCLUSIVAMENTE con este formato JSON, sin texto extra:
+        {{"codigo_elegido": "ESCRIBI_EL_CODIGO_AQUI_O_NINGUNA"}}
         """
         
         response = client.chat.completions.create(
             model=model_name,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.0, # Cero creatividad para que sea ultra preciso
-            max_tokens=50
+            temperature=0.0, # Totalmente frío y preciso
+            max_tokens=40
         )
         
         respuesta_texto = response.choices[0].message.content.strip()
-        # Limpiamos posibles formatos de bloque de código que devuelven los modelos
         respuesta_texto = respuesta_texto.replace("```json", "").replace("```", "").strip()
         
         datos_json = json.loads(respuesta_texto)
-        codigo = datos_json.get("codigo_elegido")
+        codigo = str(datos_json.get("codigo_elegido")).strip()
         
-        if codigo and codigo != "NINGUNA":
-            match = candidatos_df[candidatos_df['codigo'] == str(codigo)]
+        if codigo and codigo != "NINGUNA" and codigo != "None":
+            match = candidatos_df[candidatos_df['codigo'] == codigo]
             if not match.empty:
                 return match.iloc[0]
     except Exception as e:
-        # Si la IA falla por algún motivo, el programa avisa silenciosamente en la consola
-        print(f"Error en llamada de IA: {e}")
+        print(f"Error en IA: {e}")
         
     return None
-
+    
 # --- PASO 1: CARGAR LA LISTA DE PRECIOS DEL NEGOCIO ---
 st.header("1️⃣ Paso 1: Cargá la Lista de Precios de JIELI")
 archivo_precios = st.file_uploader("Subí tu archivo oficial de precios (.xlsx)", type=["xlsx"], key="lista_maestra")
