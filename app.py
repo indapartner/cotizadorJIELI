@@ -148,4 +148,73 @@ else:
                     
                     # El vendedor elige en vivo cuál es el verdadero producto
                     seleccionado = st.selectbox(
-                        "⚠️ Encontré varias opciones parecidas. Sele
+                        "⚠️ Encontré varias opciones parecidas. Seleccioná la correcta:",
+                        opciones_combo,
+                        key=f"select_{i}"
+                    )
+                    respuestas_usuario[i] = mapeo_codigos[seleccionado]
+                st.markdown("---")
+                
+            btn_calcular = st.form_submit_button("💰 GENERAR COTIZACIÓN FINAL DEFINITIVA")
+        
+        # --- PROCESAMIENTO FINAL TRAS LA VALIDACIÓN ---
+        if btn_calcular:
+            st.header("4️⃣ Presupuesto Final Verificado")
+            resultados_finales = []
+            
+            for i, item in enumerate(pedido_raw):
+                desc_c = item["descripcion"]
+                cant_c = item["cantidad"]
+                codigo_elegido = respuestas_usuario[i]
+                
+                try:
+                    cant_c = float(cant_c) if pd.notna(cant_c) else 1.0
+                except:
+                    cant_c = 1.0
+                
+                if codigo_elegido in ["NO_ENCONTRADO", "SALTAR"]:
+                    resultados_finales.append({
+                        "Solicitado por Cliente": desc_c,
+                        "Cant.": cant_c,
+                        "Producto JIELI Confirmado": "❌ Excluido o no encontrado",
+                        "Código": "—",
+                        "Precio Unit. S/IVA": "$0.00",
+                        "Subtotal S/IVA": 0.0,
+                        "Subtotal C/IVA": 0.0
+                    })
+                else:
+                    match = df_oficial[df_oficial['codigo'] == codigo_elegido].iloc[0]
+                    p_siva = float(match['precio_siva']) if pd.notna(match['precio_siva']) else 0.0
+                    p_civa = float(match['precio_civa']) if pd.notna(match['precio_civa']) else 0.0
+                    
+                    resultados_finales.append({
+                        "Solicitado por Cliente": desc_c,
+                        "Cant.": cant_c,
+                        "Producto JIELI Confirmado": match['detalle'],
+                        "Código": match['codigo'],
+                        "Precio Unit. S/IVA": f"${p_siva:,.2f}",
+                        "Subtotal S/IVA": p_siva * cant_c,
+                        "Subtotal C/IVA": p_civa * cant_c
+                    })
+                    
+            df_res = pd.DataFrame(resultados_finales)
+            st.dataframe(df_res.drop(columns=["Subtotal S/IVA", "Subtotal C/IVA"]), use_container_width=True)
+            
+            tot_siva = df_res["Subtotal S/IVA"].sum()
+            tot_civa = df_res["Subtotal C/IVA"].sum()
+            
+            col1, col2 = st.columns(2)
+            col1.metric("TOTAL NETO (Sin IVA)", f"${tot_siva:,.2f}")
+            col2.metric("TOTAL FINAL (Con IVA)", f"${tot_civa:,.2f}")
+            
+            import io
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                df_res.to_excel(writer, index=False, sheet_name='PresupuestoJIELI')
+            
+            st.download_button(
+                label="📥 Descargar Cotización Verificada (.xlsx)",
+                data=output.getvalue(),
+                file_name="cotizacion_jieli_verificada.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
