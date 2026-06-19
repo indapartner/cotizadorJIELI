@@ -2,26 +2,25 @@ import streamlit as st
 import pandas as pd
 import re
 import unicodedata
-import os
-import json
+import io
 
-try:
-    from openai import OpenAI
-    HAS_OPENAI = True
-except ImportError:
-    HAS_OPENAI = False
+# Configuración de la interfaz
+st.set_page_config(page_title="Cotizador JIELI Automatizado", page_icon="⚡", layout="wide")
 
-st.set_page_config(page_title="Cotizador JIELI con Validación", page_icon="⚡", layout="wide")
+st.title("⚡ Cotizador Inteligente Conectado a Drive — JIELI")
+st.markdown("Los catálogos, correctores de errores y prioridades se leen en vivo desde Google Drive. Cargá el pedido del cliente para cotizar.")
 
-st.title("⚡ Cotizador Inteligente con Control de Calidad — JIELI")
-st.markdown("Si el sistema no está 100% seguro de un producto, te va a pedir que lo selecciones manualmente antes de darte los precios finales.")
+# --- DEFINICIÓN DE LINKS DE DESCARGA DIRECTA (TUS ENLACES REALES) ---
+ID_PRECIOS = "1X2d9ZMcJyK2mN2_gfLAW5NSfMYb17puf"
+ID_CORRECTOR = "1o3LFTLye3G3jIazdBVZUX2mbjHWSk5MhQ8lnS37m0Jw"
+ID_PRIORIDAD = "1CdrOzXv9Ig69q9cOqlj84bZXcx8wxZEh-XIaAEQytOI"
 
-# --- BARRA LATERAL: CONFIGURACIÓN DE LA IA (OPCIONAL) ---
-st.sidebar.header("🔑 Configuración")
-api_key = st.sidebar.text_input("Pegá tu API Key (Opcional si querés IA):", type="password")
-provider = st.sidebar.selectbox("Proveedor de IA:", ["Groq (Llama 3.3)", "DeepSeek Oficial"])
+# Transformación de links para lectura de Pandas
+URL_PRECIOS = f"https://docs.google.com/spreadsheets/d/{ID_PRECIOS}/export?format=xlsx"
+URL_CORRECTOR = f"https://docs.google.com/spreadsheets/d/{ID_CORRECTOR}/gviz/tq?tqx=out:csv"
+URL_PRIORIDAD = f"https://docs.google.com/spreadsheets/d/{ID_PRIORIDAD}/gviz/tq?tqx=out:csv"
 
-# --- FUNCIONES DE NORMALIZACIÓN Y BÚSQUEDA ---
+# --- FUNCIONES DE LIMPIEZA SEMÁNTICA ---
 def normalizar_texto(texto):
     if not isinstance(texto, str):
         return ""
@@ -29,192 +28,168 @@ def normalizar_texto(texto):
     texto = "".join(c for c in texto if unicodedata.category(c) != "Mn")
     return texto.lower().strip()
 
-def buscar_candidatos_estrictos(detalle_cliente, df_precios):
-    """Busca productos locales usando el método viejo confiable de palabras clave"""
-    palabras = [w for w in re.split(r'\W+', normalizar_texto(detalle_cliente)) if len(w) > 2]
-    if not palabras:
-        return pd.DataFrame()
-    
-    # Intento 1: Que contenga TODAS las palabras (Match de alta confianza)
-    match_estricto = df_precios[df_precios['_norm_detalle'].apply(lambda x: all(p in x for p in palabras))]
-    if not match_estricto.empty:
-        return match_estricto
-        
-    # Intento 2: Que contenga al menos las dos primeras (Match intermedio)
-    if len(palabras) >= 2:
-        match_medio = df_precios[df_precios['_norm_detalle'].str.contains(palabras[0], na=False) & 
-                                 df_precios['_norm_detalle'].str.contains(palabras[1], na=False)]
-        if not match_medio.empty:
-            return match_medio
-
-    # Intento 3: Caída libre a la primera palabra importante (Baja confianza)
-    return df_precios[df_precios['_norm_detalle'].str.contains(palabras[0], na=False)].head(10)
-
-# --- PASO 1: CARGAR LA LISTA DE PRECIOS DEL NEGOCIO ---
-st.header("1️⃣ Paso 1: Cargá la Lista de Precios de JIELI")
-archivo_precios = st.file_uploader("Subí tu archivo oficial de precios (.xlsx)", type=["xlsx"], key="lista_maestra")
-
-df_oficial = None
-
-if archivo_precios is not None:
+# --- CARGA AUTOMÁTICA DESDE DRIVE (CACHE DE 15 MINUTOS) ---
+@st.cache_data(ttl=900)
+def cargar_datos_desde_drive():
     try:
-        df_oficial = pd.read_excel(archivo_precios, skiprows=2)
+        # 1. Cargar Lista de Precios Oficial (.xlsx original)
+        # Saltea las primeras 2 filas basándose en tu estructura original
+        df_oficial = pd.read_excel(URL_PRECIOS, skiprows=2)
         df_oficial.columns = ["codigo", "detalle", "moneda", "precio_siva", "precio_civa", "tasa_iva"] + list(df_oficial.columns[6:])
         df_oficial['codigo'] = df_oficial['codigo'].astype(str).str.strip()
         df_oficial['_norm_detalle'] = df_oficial['detalle'].apply(normalizar_texto)
-        st.success(f"¡Catálogo cargado! {len(df_oficial)} productos listos.")
+        
+        # 2. Cargar Corrector de Errores (Google Sheet)
+        try:
+            df_err = pd.read_csv(URL_CORRECTOR)
+            if 'Texto Cliente' in df_err.columns:
+                df_err['_norm_cliente'] = df_err['Texto Cliente'].astype(str).apply(normalizar_texto)
+        except Exception as e:
+            df_err = pd.DataFrame()
+            st.sidebar.warning(f"Aviso en Corrector: {e}")
+            
+        # 3. Cargar Prioridad de Marcas (Google Sheet)
+        try:
+            df_mrc = pd.read_csv(URL_PRIORIDAD)
+        except Exception as e:
+            df_mrc = pd.DataFrame()
+            st.sidebar.warning(f"Aviso en Prioridades: {e}")
+            
+        return df_oficial, df_err, df_mrc, "✅ Datos sincronizados con Google Drive correctamente."
     except Exception as e:
-        st.error(f"Error al procesar la lista de precios: {e}")
+        return None, None, None, f"❌ Error al conectar con Google Drive: {e}. Verificá los accesos de los archivos."
 
-st.markdown("---")
+# Ejecutar conexión en caché
+df_oficial, df_err, df_mrc, mensaje_status = cargar_datos_desde_drive()
+st.sidebar.info(mensaje_status)
 
-# --- PASO 2: CARGAR EL PEDIDO DEL CLIENTE ---
-st.header("2️⃣ Paso 2: Cargá el Pedido de Cotización")
+# Panel de control lateral para refrescar precios manual si hiciste cambios recién en Drive
+if st.sidebar.button("🔄 Forzar actualización de Drive ahora"):
+    st.cache_data.clear()
+    st.rerun()
 
-if df_oficial is None:
-    st.warning("⚠️ Primero debes cargar una lista de precios en el Paso 1.")
-else:
-    tab_excel, tab_texto = st.tabs(["📊 Archivo Excel / CSV", "✍️ Texto de WhatsApp"])
-    pedido_raw = []
+# --- MOTOR DE REGLAS DE NEGOCIO ---
+def buscar_producto_con_reglas(detalle_cliente, df_precios, df_errores, df_marcas):
+    texto_cliente_norm = normalizar_texto(detalle_cliente)
     
-    with tab_excel:
-        archivo_cliente = st.file_uploader("Subí el presupuesto del cliente (.xlsx, .csv)", type=["xlsx", "csv"])
-        if archivo_cliente is not None:
-            try:
-                df_c = pd.read_csv(archivo_cliente) if archivo_cliente.name.endswith('.csv') else pd.read_excel(archivo_cliente)
-                cols = df_c.columns.tolist()
-                c1, c2 = st.columns(2)
-                col_des = c1.selectbox("Columna de Descripción", cols, index=1 if len(cols)>1 else 0)
-                col_cant = c2.selectbox("Columna de Cantidad", cols, index=2 if len(cols)>2 else 0)
+    # REGLA 1: Tu tabla manual de Corrección de Errores
+    if df_errores is not None and not df_errores.empty and '_norm_cliente' in df_errores.columns:
+        match_error = df_errores[df_errores['_norm_cliente'] == texto_cliente_norm]
+        if not match_error.empty:
+            codigo_corregido = str(match_error.iloc[0]['Codigo Oficial JIELI']).strip()
+            resultado_oficial = df_precios[df_precios['codigo'] == codigo_corregido]
+            if not resultado_oficial.empty:
+                return resultado_oficial.iloc[0], "🎯 Match por Corrección en Drive"
+
+    # REGLA 2: Palabras clave estrictas (Viejo confiable local)
+    palabras = [w for w in re.split(r'\W+', texto_cliente_norm) if len(w) > 2]
+    if not palabras:
+        return None, "❌ Sin coincidencia"
+        
+    candidatos = df_precios[df_precios['_norm_detalle'].apply(lambda x: all(p in x for p in palabras))]
+    
+    if candidatos.empty and len(palabras) >= 2:
+        candidatos = df_precios[df_precios['_norm_detalle'].str.contains(palabras[0], na=False) & 
+                                 df_precios['_norm_detalle'].str.contains(palabras[1], na=False)]
+    
+    if not candidatos.empty:
+        if len(candidatos) == 1:
+            return candidatos.iloc[0], "✅ Match Único Directo"
+            
+        # REGLA 3: Tu tabla manual de Prioridad de Marcas
+        if df_marcas is not None and not df_marcas.empty and 'Marca' in df_marcas.columns:
+            candidatos = candidatos.copy()
+            candidatos['prioridad_orden'] = 999
+            
+            for _, fila_marca in df_marcas.iterrows():
+                marca_norm = normalizar_texto(fila_marca['Marca'])
+                candidatos.loc[candidatos['_norm_detalle'].str.contains(marca_norm, na=False), 'prioridad_orden'] = fila_marca['Prioridad']
+            
+            candidatos = candidatos.sort_values(by='prioridad_orden')
+            
+        return candidatos.iloc[0], "⭐ Match por Prioridad de Marca"
+        
+    return None, "❌ Sin coincidencia"
+
+
+# --- INTERFAZ DE CARGA PARA VENDEDORES ---
+if df_oficial is None:
+    st.error("Error de inicialización. Por favor revisá que los links de Google Drive estén en modo público (Lector).")
+else:
+    archivo_cliente = st.file_uploader("Subí el presupuesto del cliente (.xlsx o .csv)", type=["xlsx", "csv"])
+    
+    if archivo_cliente is not None:
+        try:
+            df_c = pd.read_csv(archivo_cliente) if archivo_cliente.name.endswith('.csv') else pd.read_excel(archivo_cliente)
+            cols = df_c.columns.tolist()
+            
+            c1, c2 = st.columns(2)
+            col_des = c1.selectbox("Columna de Descripción/Producto", cols, index=1 if len(cols)>1 else 0)
+            col_cant = c2.selectbox("Columna de Cantidad", cols, index=2 if len(cols)>2 else 0)
+            
+            if st.button("🚀 Cotizar todo instantáneamente"):
+                resultados_finales = []
                 
                 for _, fila in df_c.iterrows():
-                    desc = str(fila[col_des])
-                    cant = fila[col_cant]
-                    if desc.strip() == "" or "ETAPA" in desc.upper() or desc == "nan":
+                    desc_c = str(fila[col_des])
+                    cant_c = fila[col_cant]
+                    
+                    if desc_c.strip() == "" or "ETAPA" in desc_c.upper() or desc_c == "nan":
                         continue
-                    pedido_raw.append({"descripcion": desc, "cantidad": cant})
-            except Exception as e:
-                st.error(f"Error: {e}")
-
-    with tab_texto:
-        texto_cliente = st.text_area("Pegá el texto de WhatsApp acá:")
-        if texto_cliente:
-            for linea in texto_cliente.split("\n"):
-                if linea.strip():
-                    match_cant = re.match(r'^(\d+)', linea.strip())
-                    cant = float(match_cant.group(1)) if match_cant else 1.0
-                    desc = linea.replace(match_cant.group(1), "", 1).strip() if match_cant else linea.strip()
-                    pedido_raw.append({"descripcion": desc, "cantidad": cant})
-
-    # --- NUEVA LÓGICA: PANTALLA INTERMEDIA DE REVISIÓN ---
-    if pedido_raw:
-        st.markdown("---")
-        st.header("3️⃣ Paso 3: Control de Calidad (Validación del Vendedor)")
-        st.info("Revisá los productos que tienen dudas. Si el sistema encontró un único match perfecto, ya lo pre-seleccionó.")
-        
-        # Usamos un formulario para congelar la pantalla hasta que el vendedor termine de elegir
-        with st.form("formulario_validacion"):
-            respuestas_usuario = {}
-            
-            for i, item in enumerate(pedido_raw):
-                desc_c = item["descripcion"]
-                cant_c = item["cantidad"]
-                
-                # Buscamos candidatos reales en tu Excel
-                candidatos = buscar_candidatos_estrictos(desc_c, df_oficial)
-                
-                st.markdown(f"**Item del Cliente:** `{cant_c}` x *\"{desc_c}\"*")
-                
-                if candidatos.empty:
-                    st.warning("❌ No se encontró ninguna coincidencia en el catálogo.")
-                    respuestas_usuario[i] = "NO_ENCONTRADO"
-                elif len(candidatos) == 1:
-                    # SI HAY UN SOLO RESULTADO PERFECTO: Se selecciona directo (Match Automático)
-                    fila = candidatos.iloc[0]
-                    st.success(f"✅ Match Automático Directo: **{fila['detalle']}** (Cód: {fila['codigo']})")
-                    respuestas_usuario[i] = fila['codigo']
-                else:
-                    # SI HAY DUDAS (Múltiples opciones): Creamos un desplegable interactivo para el vendedor
-                    opciones_combo = []
-                    mapeo_codigos = {}
+                        
+                    try:
+                        cant_c = float(cant_c) if pd.notna(cant_c) else 1.0
+                    except:
+                        cant_c = 1.0
+                        
+                    match, metodo = buscar_producto_con_reglas(desc_c, df_oficial, df_err, df_mrc)
                     
-                    for _, fila in candidatos.iterrows():
-                        label = f"Cód: {fila['codigo']} | {fila['detalle']} | Precio S/IVA: ${fila['precio_siva']}"
-                        opciones_combo.append(label)
-                        mapeo_codigos[label] = fila['codigo']
-                    
-                    opciones_combo.append("❌ Ninguno de estos es correcto (Saltar ítem)")
-                    mapeo_codigos["❌ Ninguno de estos es correcto (Saltar ítem)"] = "SALTAR"
-                    
-                    # El vendedor elige en vivo cuál es el verdadero producto
-                    seleccionado = st.selectbox(
-                        "⚠️ Encontré varias opciones parecidas. Seleccioná la correcta:",
-                        opciones_combo,
-                        key=f"select_{i}"
-                    )
-                    respuestas_usuario[i] = mapeo_codigos[seleccionado]
-                st.markdown("---")
+                    if match is not None:
+                        p_siva = float(match['precio_siva']) if pd.notna(match['precio_siva']) else 0.0
+                        p_civa = float(match['precio_civa']) if pd.notna(match['precio_civa']) else 0.0
+                        
+                        resultados_finales.append({
+                            "Pedido Cliente": desc_c,
+                            "Cant.": cant_c,
+                            "Producto JIELI Sugerido": match['detalle'],
+                            "Código": match['codigo'],
+                            "Unit. S/IVA": f"${p_siva:,.2f}",
+                            "Subtotal S/IVA": p_siva * cant_c,
+                            "Subtotal C/IVA": p_civa * cant_c,
+                            "Lógica Aplicada": metodo
+                        })
+                    else:
+                        resultados_finales.append({
+                            "Pedido Cliente": desc_c,
+                            "Cant.": cant_c,
+                            "Producto JIELI Sugerido": "❌ NO ENCONTRADO",
+                            "Código": "—",
+                            "Unit. S/IVA": "$0.00",
+                            "Subtotal S/IVA": 0.0,
+                            "Subtotal C/IVA": 0.0,
+                            "Lógica Aplicada": "❌ Sin Coincidencia"
+                        })
                 
-            btn_calcular = st.form_submit_button("💰 GENERAR COTIZACIÓN FINAL DEFINITIVA")
-        
-        # --- PROCESAMIENTO FINAL TRAS LA VALIDACIÓN ---
-        if btn_calcular:
-            st.header("4️⃣ Presupuesto Final Verificado")
-            resultados_finales = []
-            
-            for i, item in enumerate(pedido_raw):
-                desc_c = item["descripcion"]
-                cant_c = item["cantidad"]
-                codigo_elegido = respuestas_usuario[i]
+                df_res = pd.DataFrame(resultados_finales)
+                st.subheader("💰 Presupuesto Final Generado")
+                st.dataframe(df_res, use_container_width=True)
                 
-                try:
-                    cant_c = float(cant_c) if pd.notna(cant_c) else 1.0
-                except:
-                    cant_c = 1.0
+                tot_siva = df_res["Subtotal S/IVA"].sum()
+                tot_civa = df_res["Subtotal C/IVA"].sum()
                 
-                if codigo_elegido in ["NO_ENCONTRADO", "SALTAR"]:
-                    resultados_finales.append({
-                        "Solicitado por Cliente": desc_c,
-                        "Cant.": cant_c,
-                        "Producto JIELI Confirmado": "❌ Excluido o no encontrado",
-                        "Código": "—",
-                        "Precio Unit. S/IVA": "$0.00",
-                        "Subtotal S/IVA": 0.0,
-                        "Subtotal C/IVA": 0.0
-                    })
-                else:
-                    match = df_oficial[df_oficial['codigo'] == codigo_elegido].iloc[0]
-                    p_siva = float(match['precio_siva']) if pd.notna(match['precio_siva']) else 0.0
-                    p_civa = float(match['precio_civa']) if pd.notna(match['precio_civa']) else 0.0
-                    
-                    resultados_finales.append({
-                        "Solicitado por Cliente": desc_c,
-                        "Cant.": cant_c,
-                        "Producto JIELI Confirmado": match['detalle'],
-                        "Código": match['codigo'],
-                        "Precio Unit. S/IVA": f"${p_siva:,.2f}",
-                        "Subtotal S/IVA": p_siva * cant_c,
-                        "Subtotal C/IVA": p_civa * cant_c
-                    })
-                    
-            df_res = pd.DataFrame(resultados_finales)
-            st.dataframe(df_res.drop(columns=["Subtotal S/IVA", "Subtotal C/IVA"]), use_container_width=True)
-            
-            tot_siva = df_res["Subtotal S/IVA"].sum()
-            tot_civa = df_res["Subtotal C/IVA"].sum()
-            
-            col1, col2 = st.columns(2)
-            col1.metric("TOTAL NETO (Sin IVA)", f"${tot_siva:,.2f}")
-            col2.metric("TOTAL FINAL (Con IVA)", f"${tot_civa:,.2f}")
-            
-            import io
-            output = io.BytesIO()
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                df_res.to_excel(writer, index=False, sheet_name='PresupuestoJIELI')
-            
-            st.download_button(
-                label="📥 Descargar Cotización Verificada (.xlsx)",
-                data=output.getvalue(),
-                file_name="cotizacion_jieli_verificada.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+                col1, col2 = st.columns(2)
+                col1.metric("TOTAL NETO (Sin IVA)", f"${tot_siva:,.2f}")
+                col2.metric("TOTAL FACTURADO (Con IVA)", f"${tot_civa:,.2f}")
+                
+                output = io.BytesIO()
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                    df_res.to_excel(writer, index=False, sheet_name='Presupuesto')
+                
+                st.download_button(
+                    label="📥 Descargar Cotización en Excel",
+                    data=output.getvalue(),
+                    file_name="cotizacion_jieli_final.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+        except Exception as e:
+            st.error(f"Error al procesar el archivo del cliente: {e}")
