@@ -53,7 +53,9 @@ def cargar_bases():
 # --- Lógica de IA y Procesamiento ---
 def llamar_llm_gemini(texto_cliente):
     api_key = st.secrets["GEMINI_API_KEY"]
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={api_key}"
+    
+    # Usamos el alias universal "gemini-pro" que no falla por versiones
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={api_key}"
     
     prompt = f"""
     Eres un extractor de datos técnicos de materiales eléctricos.
@@ -70,19 +72,15 @@ def llamar_llm_gemini(texto_cliente):
     try:
         response = requests.post(url, json=payload)
         
-        # 1. Chequeamos si Google nos rebotó la conexión (ej. API key mala, Rate limit)
         if response.status_code != 200:
             return {"error": f"Error API {response.status_code}: {response.text[:100]}"}
             
         data = response.json()
         
-        # 2. Chequeamos si la IA bloqueó el texto por algún filtro de seguridad
         if 'candidates' not in data or len(data['candidates']) == 0:
             return {"error": "Respuesta vacía o bloqueada por Gemini"}
             
         texto_respuesta = data['candidates'][0]['content']['parts'][0]['text']
-        
-        # 3. Limpiamos cualquier formato markdown ("```json ... ```") que a veces mete la IA
         texto_respuesta = texto_respuesta.strip().removeprefix("```json").removesuffix("```").strip()
         
         return json.loads(texto_respuesta)
