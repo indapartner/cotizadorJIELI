@@ -8,7 +8,7 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
-st.set_page_config(page_title="Cotizador B2B", layout="centered")
+st.set_page_config(page_title="Cotizador B2B", layout="centered", page_icon="⚡")
 st.title("Cotizador IA - B2B")
 
 # --- Conexión y Descarga de Drive ---
@@ -54,7 +54,7 @@ def cargar_bases():
 def llamar_llm_gemini(texto_cliente):
     api_key = st.secrets["GEMINI_API_KEY"]
     
-    # ACTUALIZADO 2026: Usamos la generación actual (gemini-2.5-flash)
+    # Usamos la generación actual
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
     
     prompt = f"""
@@ -91,6 +91,11 @@ def llamar_llm_gemini(texto_cliente):
         return {"error": f"Falla interna: {str(e)}"}
 
 def procesar_cotizacion(texto_cliente, df_precios, df_correcciones, df_marcas):
+    codigo_final = None
+    detalle_final = "NO_ENCONTRADO"
+    precio_final = 0.0
+    error_msg = None
+
     # 1. Bypass determinista (Opcional - Tolerante a fallos)
     try:
         cols_corr = [str(c).lower().strip() for c in df_correcciones.columns]
@@ -100,38 +105,67 @@ def procesar_cotizacion(texto_cliente, df_precios, df_correcciones, df_marcas):
             
             bypass = df_corr_temp[df_corr_temp['texto cliente'].astype(str).str.lower() == str(texto_cliente).lower().strip()]
             if not bypass.empty:
-                return bypass.iloc[0]['codigo oficial jieli']
+                codigo_final = bypass.iloc[0]['codigo oficial jieli']
     except Exception:
         pass
     
-    # 2. Extracción IA
-    datos = llamar_llm_gemini(texto_cliente)
-    
-    # Si la IA devolvió un error, lo pasamos directo para verlo en el archivo
-    if isinstance(datos, dict) and "error" in datos:
-        return datos["error"]
-    elif not datos:
-        return "ERROR_LLM_DESCONOCIDO"
-    
-    producto = datos.get('producto', '')
-    marca_solicitada = datos.get('marca', '')
-    
-    # 3. Fallback y búsqueda en Lista de Precios
-    try:
-        df_precios_temp = df_precios.copy()
-        df_precios_temp.columns = [str(c).lower().strip() for c in df_precios.columns]
+    # 2. Extracción IA y Búsqueda de Código (Si no hubo bypass)
+    if not codigo_final:
+        datos = llamar_llm_gemini(texto_cliente)
         
-        candidatos = df_precios_temp[df_precios_temp['detalle'].astype(str).str.contains(str(producto), case=False, na=False)]
+        if isinstance(datos, dict) and "error" in datos:
+            error_msg = datos["error"]
+        elif not datos:
+            error_msg = "ERROR_LLM_DESCONOCIDO"
+        else:
+            producto = datos.get('producto', '')
+            marca_solicitada = datos.get('marca', '')
+            
+            try:
+                df_precios_temp = df_precios.copy()
+                df_precios_temp.columns = [str(c).lower().strip() for c in df_precios.columns]
+                
+                candidatos = df_precios_temp[df_precios_temp['detalle'].astype(str).str.contains(str(producto), case=False, na=False)]
+                
+                if marca_solicitada and str(marca_solicitada).lower() != "null":
+                    candidatos = candidatos[candidatos['detalle'].astype(str).str.contains(str(marca_solicitada), case=False, na=False)]
+                
+                if not candidatos.empty:
+                    codigo_final = candidatos.iloc[0]['código']
+                else:
+                    error_msg = "SIN_COINCIDENCIAS"
+            except Exception:
+                error_msg = "ERROR_COLUMNAS_PRECIOS"
+
+    # 3. Traer Detalle y Precio desde la base usando el Código Final
+    if codigo_final and not error_msg:
+        try:
+            df_precios_temp = df_precios.copy()
+            cols_precios = [str(c).lower().strip() for c in df_precios.columns]
+            df_precios_temp.columns = cols_precios
+            
+            if 'código' in cols_precios:
+                match = df_precios_temp[df_precios_temp['código'].astype(str) == str(codigo_final)]
+                if not match.empty:
+                    detalle_final = match.iloc[0]['detalle'] if 'detalle' in cols_precios else "Sin columna 'Detalle'"
+                    
+                    # Busca dinámicamente cualquier columna que contenga "precio"
+                    col_precio = next((c for c in cols_precios if 'precio' in c), None)
+                    if col_precio:
+                        precio_final = match.iloc[0][col_precio]
+                    else:
+                        precio_final = "Sin columna 'Precio'"
+                else:
+                    detalle_final = "CÓDIGO_NO_EN_LISTA"
+                    precio_final = "-"
+        except Exception:
+            detalle_final = "ERROR_BUSQUEDA_DATOS"
+            precio_final = "ERROR"
+
+    if error_msg:
+        return error_msg, "-", "-"
         
-        if marca_solicitada and str(marca_solicitada).lower() != "null":
-            candidatos = candidatos[candidatos['detalle'].astype(str).str.contains(str(marca_solicitada), case=False, na=False)]
-        
-        if candidatos.empty:
-            return "SIN_COINCIDENCIAS"
-        
-        return candidatos.iloc[0]['código']
-    except Exception:
-        return "ERROR_COLUMNAS_PRECIOS"
+    return codigo_final, detalle_final, precio_final
 
 # --- Interfaz Visual y Ejecución Masiva ---
 try:
@@ -163,7 +197,10 @@ if archivo_cliente:
         columna_texto = st.selectbox("Seleccioná qué columna contiene el detalle del material:", columnas_disponibles)
         
         if st.button("Procesar Cotización Completa", type="primary"):
-            resultados = []
+            resultados_sku = []
+            resultados_detalle = []
+            resultados_precio = []
+            
             barra_progreso = st.progress(0)
             total_filas = len(df_cliente)
             
@@ -172,16 +209,25 @@ if archivo_cliente:
                     texto_item = str(row[columna_texto])
                     
                     if texto_item.strip() == "" or texto_item.lower() == "nan":
-                        resultados.append("FILA_VACIA")
+                        resultados_sku.append("FILA_VACIA")
+                        resultados_detalle.append("-")
+                        resultados_precio.append("-")
                     else:
-                        codigo = procesar_cotizacion(texto_item, df_precios, df_correcciones, df_marcas)
-                        resultados.append(codigo)
-                        time.sleep(2) 
+                        codigo, detalle, precio = procesar_cotizacion(texto_item, df_precios, df_correcciones, df_marcas)
+                        resultados_sku.append(codigo)
+                        resultados_detalle.append(detalle)
+                        resultados_precio.append(precio)
+                        
+                        # --- PAUSA DE 5 SEGUNDOS (Límite 12 RPM para Google Free) ---
+                        time.sleep(5) 
                     
                     progreso_actual = (index + 1) / total_filas
                     barra_progreso.progress(progreso_actual)
             
-            df_cliente['SKU_Asignado'] = resultados
+            # Agregamos las tres columnas al Excel final
+            df_cliente['SKU_Asignado'] = resultados_sku
+            df_cliente['Detalle_Lista_Oficial'] = resultados_detalle
+            df_cliente['Precio_Unitario'] = resultados_precio
             
             st.success("Procesamiento finalizado.")
             st.dataframe(df_cliente)
