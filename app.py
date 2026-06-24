@@ -4,12 +4,25 @@ import json
 import requests
 import io
 import time
+import re
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
 st.set_page_config(page_title="Cotizador B2B", layout="centered", page_icon="⚡")
 st.title("Cotizador IA - B2B")
+
+# --- Función de Normalización Básica ---
+def normalizar_texto(texto):
+    if pd.isna(texto): return ""
+    t = str(texto).lower().strip()
+    t = t.replace('á','a').replace('é','e').replace('í','i').replace('ó','o').replace('ú','u')
+    t = t.replace(',', '.')
+    t = t.replace('.00', '').replace('.0', '')
+    t = re.sub(r'\s*x\s*', 'x', t) 
+    t = re.sub(r'(\d)\s+(mm2|mm|a|v|w|kva|hp|cv|m|cm|kv)\b', r'\1\2', t) 
+    t = t.replace('"', '').replace("'", "")
+    return " ".join(t.split())
 
 # --- Conexión y Descarga de Drive ---
 @st.cache_resource
@@ -43,160 +56,137 @@ def descargar_archivo(_drive_service, file_id, header=0):
 @st.cache_data(ttl=3600)
 def cargar_bases():
     drive = get_drive_service()
-    
     df_precios = descargar_archivo(drive, st.secrets["ID_LISTA_PRECIOS"], header=1)
     df_correcciones = descargar_archivo(drive, st.secrets["ID_CORRECCIONES"], header=0)
-    df_marcas = descargar_archivo(drive, st.secrets["ID_MARCAS"], header=0)
-    
-    return df_precios, df_correcciones, df_marcas
+    return df_precios, df_correcciones
 
-# --- Lógica de IA y Procesamiento ---
-def llamar_llm_gemini(texto_cliente):
+# --- LA NUEVA LÓGICA: IA COMO JUEZ FINAL ---
+def llamar_llm_juez(texto_cliente, lista_candidatos):
     api_key = st.secrets["GEMINI_API_KEY"]
-    
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
     
-    # NUEVO PROMPT: Obligamos a la IA a separar TODO en atributos para no romper la búsqueda
     prompt = f"""
-    Eres un experto en materiales eléctricos. Analiza esta solicitud: '{texto_cliente}'
-    Extrae la información y devuelve ÚNICAMENTE un JSON con esta estructura:
-    {{"producto": "palabra clave principal", "atributos": ["atr1", "atr2"], "marca": "marca si existe o null"}}
-    REGLA: El "producto" debe ser de 1 o 2 palabras (ej: cable, termica, cano). Todo lo demás (medidas, polos, colores) va a "atributos".
-    Ejemplo si es 'Termica 2x16 Sica': {{"producto": "termica", "atributos": ["2x16", "16A", "bipolar"], "marca": "Sica"}}
-    Ejemplo si es 'cable unipolar 4mm verde': {{"producto": "cable", "atributos": ["unipolar", "4mm", "verde"], "marca": "null"}}
+    Eres el jefe de ventas de una casa de materiales eléctricos.
+    Un cliente te pidió cotizar exactamente esto: "{texto_cliente}"
+    
+    Tu asistente buscó en el sistema y te trajo una pre-selección con estos posibles productos de la lista de precios oficial:
+    {json.dumps(lista_candidatos, indent=2, ensure_ascii=False)}
+    
+    Tu tarea:
+    1. Analizar semánticamente el pedido del cliente (ej: "térmica" = "termomagnética", "4mm" = "4.00 mm", "cable" = "conductor").
+    2. Leer la pre-selección y elegir el producto que cumple EXACTAMENTE con lo pedido.
+    3. Si ninguna de las opciones sirve, o le falta un dato clave (ej: pide 4mm y solo hay de 2.5mm), debes rechazarlo.
+    
+    Devuelve ÚNICAMENTE un JSON con esta estructura:
+    {{"codigo_elegido": "el código alfanumérico del producto ganador, o la palabra 'SIN_COINCIDENCIAS'", "razonamiento": "por qué lo elegiste en 10 palabras"}}
     """
     
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"responseMimeType": "application/json"}
+        "generationConfig": {"responseMimeType": "application/json", "temperature": 0.1}
     }
     
     try:
         response = requests.post(url, json=payload)
-        
         if response.status_code != 200:
-            return {"error": f"Error API {response.status_code}: {response.text[:100]}"}
+            return {"error": f"Error API {response.status_code}"}
             
         data = response.json()
-        
         if 'candidates' not in data or len(data['candidates']) == 0:
-            return {"error": "Respuesta vacía o bloqueada por Gemini"}
+            return {"error": "Respuesta vacía"}
             
         texto_respuesta = data['candidates'][0]['content']['parts'][0]['text']
         texto_respuesta = texto_respuesta.strip().removeprefix("```json").removesuffix("```").strip()
-        
         return json.loads(texto_respuesta)
         
-    except json.JSONDecodeError:
-        return {"error": f"La IA no devolvió un JSON válido. Devolvió: {texto_respuesta[:50]}"}
     except Exception as e:
-        return {"error": f"Falla interna: {str(e)}"}
+        return {"error": str(e)}
 
-def procesar_cotizacion(texto_cliente, df_precios, df_correcciones, df_marcas):
-    codigo_final = None
-    detalle_final = "NO_ENCONTRADO"
-    precio_final = 0.0
-    error_msg = None
-
-    # 1. Bypass determinista
+def procesar_cotizacion(texto_cliente, df_precios, df_correcciones):
+    # 1. Bypass (Correcciones manuales)
     try:
         cols_corr = [str(c).lower().strip() for c in df_correcciones.columns]
         if 'texto cliente' in cols_corr and 'codigo oficial jieli' in cols_corr:
             df_corr_temp = df_correcciones.copy()
             df_corr_temp.columns = cols_corr
-            
             bypass = df_corr_temp[df_corr_temp['texto cliente'].astype(str).str.lower() == str(texto_cliente).lower().strip()]
             if not bypass.empty:
-                codigo_final = bypass.iloc[0]['codigo oficial jieli']
+                codigo_ganador = bypass.iloc[0]['codigo oficial jieli']
+                return obtener_datos_por_codigo(codigo_ganador, df_precios)
     except Exception:
         pass
+
+    # 2. Búsqueda Previa (Shortlist) para la IA
+    # Identificamos las columnas dinámicamente
+    col_codigo = next((c for c in df_precios.columns if 'código' in str(c).lower() or 'codigo' in str(c).lower()), None)
+    col_detalle = next((c for c in df_precios.columns if 'detalle' in str(c).lower()), None)
     
-    # 2. Extracción IA y SISTEMA DE PUNTAJE
-    if not codigo_final:
-        datos = llamar_llm_gemini(texto_cliente)
+    if not col_codigo or not col_detalle:
+        return "ERROR_COLUMNAS_PRECIOS", "-", 0.0
+
+    df_temp = df_precios[[col_codigo, col_detalle]].dropna(subset=[col_detalle]).copy()
+    df_temp['detalle_norm'] = df_temp[col_detalle].apply(normalizar_texto)
+    texto_norm = normalizar_texto(texto_cliente)
+    
+    # Extraemos palabras mayores a 1 letra para buscar (ej: "cable", "unipolar", "4mm", "verde")
+    palabras = [p for p in texto_norm.split() if len(p) > 1]
+    
+    # Sumamos 1 punto por cada palabra que aparezca en el detalle del producto
+    df_temp['score'] = 0
+    for palabra in palabras:
+        df_temp['score'] += df_temp['detalle_norm'].str.contains(re.escape(palabra), case=False, regex=True).astype(int)
+    
+    # Nos quedamos con los 20 productos que más palabras compartan con el texto del cliente
+    candidatos_top = df_temp[df_temp['score'] > 0].sort_values(by='score', ascending=False).head(20)
+    
+    if candidatos_top.empty:
+        return "SIN_COINCIDENCIAS", "NO_ENCONTRADO", 0.0
+
+    # Armamos la lista para enviarle a la IA
+    lista_para_ia = candidatos_top[[col_codigo, col_detalle]].rename(columns={col_codigo: "codigo", col_detalle: "detalle"}).to_dict(orient='records')
+
+    # 3. La IA toma la decisión final leyendo el catálogo
+    respuesta_ia = llamar_llm_juez(texto_cliente, lista_para_ia)
+    
+    if isinstance(respuesta_ia, dict) and "error" in respuesta_ia:
+        return f"ERROR_LLM: {respuesta_ia['error']}", "-", 0.0
         
-        if isinstance(datos, dict) and "error" in datos:
-            error_msg = datos["error"]
-        elif not datos:
-            error_msg = "ERROR_LLM_DESCONOCIDO"
-        else:
-            producto = datos.get('producto', '')
-            marca_solicitada = datos.get('marca', '')
-            atributos = datos.get('atributos', [])
-            
-            try:
-                df_precios_temp = df_precios.copy()
-                df_precios_temp.columns = [str(c).lower().strip() for c in df_precios.columns]
-                
-                # Filtro inicial: Buscamos solo la palabra raíz (ej: "cable")
-                prod_limpio = str(producto).lower().strip()
-                candidatos = df_precios_temp[df_precios_temp['detalle'].astype(str).str.contains(prod_limpio, case=False, na=False)].copy()
-                
-                if not candidatos.empty:
-                    # --- INICIO SISTEMA DE PUNTAJE ---
-                    candidatos['score'] = 0
-                    # Truco de magia: borramos los espacios de la lista de precios para que "4 mm" y "4mm" matcheen perfecto
-                    detalle_sin_espacios = candidatos['detalle'].astype(str).str.lower().str.replace(" ", "")
-                    
-                    # Chequeo de marca (Peso fuerte: suma 2 puntos)
-                    if marca_solicitada and str(marca_solicitada).lower() not in ["null", "none", ""]:
-                        marca_limpia = str(marca_solicitada).lower().replace(" ", "")
-                        candidatos['score'] += detalle_sin_espacios.str.contains(marca_limpia).astype(int) * 2
-                    
-                    # Chequeo de atributos (Suma 1 punto por cada coincidencia exacta sin espacios)
-                    if isinstance(atributos, list):
-                        for attr in atributos:
-                            if str(attr).strip():
-                                attr_limpio = str(attr).lower().replace(" ", "")
-                                candidatos['score'] += detalle_sin_espacios.str.contains(attr_limpio).astype(int)
-                    
-                    # Ordenamos por los que sacaron mejor nota
-                    candidatos = candidatos.sort_values(by='score', ascending=False)
-                    
-                    # Nos quedamos con el mejor (si hay empate en puntaje, queda el que Pandas filtró primero, que suele ser el más exacto)
-                    codigo_final = candidatos.iloc[0]['código']
-                    # -----------------------------------
-                else:
-                    error_msg = "SIN_COINCIDENCIAS"
-            except Exception:
-                error_msg = "ERROR_COLUMNAS_PRECIOS"
-
-    # 3. Traer Detalle y Precio
-    if codigo_final and not error_msg:
-        try:
-            df_precios_temp = df_precios.copy()
-            cols_precios = [str(c).lower().strip() for c in df_precios.columns]
-            df_precios_temp.columns = cols_precios
-            
-            if 'código' in cols_precios:
-                match = df_precios_temp[df_precios_temp['código'].astype(str) == str(codigo_final)]
-                if not match.empty:
-                    detalle_final = match.iloc[0]['detalle'] if 'detalle' in cols_precios else "Sin columna 'Detalle'"
-                    
-                    col_precio = next((c for c in cols_precios if 'precio' in c), None)
-                    if col_precio:
-                        val_precio = match.iloc[0][col_precio]
-                        try:
-                            precio_final = float(str(val_precio).replace('$', '').replace('.', '').replace(',', '.').strip())
-                        except:
-                            precio_final = val_precio
-                    else:
-                        precio_final = 0.0
-                else:
-                    detalle_final = "CÓDIGO_NO_EN_LISTA"
-                    precio_final = 0.0
-        except Exception:
-            detalle_final = "ERROR_BUSQUEDA_DATOS"
-            precio_final = 0.0
-
-    if error_msg:
-        return error_msg, "-", 0.0
+    codigo_ganador = respuesta_ia.get('codigo_elegido', 'SIN_COINCIDENCIAS')
+    
+    if codigo_ganador == 'SIN_COINCIDENCIAS':
+        return "SIN_COINCIDENCIAS", "NO_ENCONTRADO", 0.0
         
-    return codigo_final, detalle_final, precio_final
+    return obtener_datos_por_codigo(codigo_ganador, df_precios)
 
-# --- Interfaz Visual y Ejecución Masiva ---
+def obtener_datos_por_codigo(codigo, df_precios):
+    cols_precios = [str(c).lower().strip() for c in df_precios.columns]
+    df_temp = df_precios.copy()
+    df_temp.columns = cols_precios
+    
+    col_codigo = next((c for c in cols_precios if 'código' in c or 'codigo' in c), None)
+    col_detalle = next((c for c in cols_precios if 'detalle' in c), None)
+    col_precio = next((c for c in cols_precios if 'precio' in c), None)
+    
+    match = df_temp[df_temp[col_codigo].astype(str) == str(codigo)]
+    
+    if not match.empty:
+        detalle = match.iloc[0][col_detalle] if col_detalle else "Sin Detalle"
+        precio = 0.0
+        if col_precio:
+            val_precio = match.iloc[0][col_precio]
+            if isinstance(val_precio, (int, float)):
+                precio = float(val_precio)
+            else:
+                val_str = str(val_precio).replace('$', '').replace('.', '').replace(',', '.').strip()
+                try: precio = float(val_str)
+                except: pass
+        return codigo, detalle, precio
+    else:
+        return codigo, "CÓDIGO_NO_EN_LISTA", 0.0
+
+# --- Interfaz Visual ---
 try:
-    df_precios, df_correcciones, df_marcas = cargar_bases()
+    df_precios, df_correcciones = cargar_bases()
     st.success("Bases de datos base sincronizadas.", icon="✅")
 except Exception as e:
     st.error(f"Error de conexión con Drive o lectura de archivos. Detalles: {e}")
@@ -221,7 +211,6 @@ if archivo_cliente:
         st.dataframe(df_cliente.head(3))
         
         columnas_disponibles = df_cliente.columns.tolist()
-        
         col1, col2 = st.columns(2)
         with col1:
             columna_texto = st.selectbox("Seleccioná la columna del DETALLE del material:", columnas_disponibles)
@@ -230,15 +219,11 @@ if archivo_cliente:
             columna_cantidad = st.selectbox("Seleccioná la columna de la CANTIDAD:", opciones_cantidad)
         
         if st.button("Procesar Cotización Completa", type="primary"):
-            resultados_sku = []
-            resultados_detalle = []
-            resultados_precio = []
-            resultados_subtotal = []
-            
+            resultados_sku, resultados_detalle, resultados_precio, resultados_subtotal = [], [], [], []
             barra_progreso = st.progress(0.0)
             total_filas = len(df_cliente)
             
-            with st.spinner("Procesando matriz fila por fila..."):
+            with st.spinner("La IA está leyendo y comparando el catálogo..."):
                 for i, (index, row) in enumerate(df_cliente.iterrows()):
                     texto_item = str(row[columna_texto])
                     
@@ -248,7 +233,7 @@ if archivo_cliente:
                         resultados_precio.append(0.0)
                         resultados_subtotal.append(0.0)
                     else:
-                        codigo, detalle, precio = procesar_cotizacion(texto_item, df_precios, df_correcciones, df_marcas)
+                        codigo, detalle, precio = procesar_cotizacion(texto_item, df_precios, df_correcciones)
                         resultados_sku.append(codigo)
                         resultados_detalle.append(detalle)
                         resultados_precio.append(precio)
@@ -265,8 +250,6 @@ if archivo_cliente:
                                 resultados_subtotal.append("CANT_INVALIDA")
                         else:
                             resultados_subtotal.append("-")
-                            
-                        time.sleep(0.1) 
                     
                     progreso_actual = min((i + 1) / total_filas, 1.0)
                     barra_progreso.progress(progreso_actual)
