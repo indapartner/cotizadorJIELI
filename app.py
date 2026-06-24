@@ -32,14 +32,11 @@ def descargar_archivo(_drive_service, file_id, header=0):
     file_stream.seek(0)
     
     try:
-        # Intentamos leer como Excel primero
         df = pd.read_excel(file_stream, header=header)
     except ValueError:
-        # Si tira error, probamos como CSV (muy común en descargas de Drive)
         file_stream.seek(0)
         df = pd.read_csv(file_stream, header=header)
         
-    # Blindaje contra espacios invisibles en los nombres de las columnas
     df.columns = df.columns.str.strip() 
     return df
 
@@ -47,10 +44,7 @@ def descargar_archivo(_drive_service, file_id, header=0):
 def cargar_bases():
     drive = get_drive_service()
     
-    # Lista de precios tiene una fila en blanco arriba de los títulos (header=1)
     df_precios = descargar_archivo(drive, st.secrets["ID_LISTA_PRECIOS"], header=1)
-    
-    # Correcciones y marcas inician en la primera fila (header=0)
     df_correcciones = descargar_archivo(drive, st.secrets["ID_CORRECCIONES"], header=0)
     df_marcas = descargar_archivo(drive, st.secrets["ID_MARCAS"], header=0)
     
@@ -82,18 +76,22 @@ def llamar_llm_gemini(texto_cliente):
     return None
 
 def procesar_cotizacion(texto_cliente, df_precios, df_correcciones, df_marcas):
-    # 1. Bypass determinista (Verificando que las columnas existan para evitar KeyErrors)
-    col_texto = 'Texto Cliente'
-    col_codigo_correccion = 'Codigo Oficial JIELI'
+    # 1. Bypass determinista (Opcional - Tolerante a fallos)
+    try:
+        # Pasamos las columnas a minúsculas para evitar errores de tipeo en el Drive
+        cols_corr = [str(c).lower().strip() for c in df_correcciones.columns]
+        if 'texto cliente' in cols_corr and 'codigo oficial jieli' in cols_corr:
+            df_corr_temp = df_correcciones.copy()
+            df_corr_temp.columns = cols_corr
+            
+            bypass = df_corr_temp[df_corr_temp['texto cliente'].astype(str).str.lower() == str(texto_cliente).lower().strip()]
+            if not bypass.empty:
+                return bypass.iloc[0]['codigo oficial jieli']
+    except Exception:
+        # Si las columnas no existen o el archivo falla, no hacemos nada y pasamos a la IA.
+        pass
     
-    if col_texto in df_correcciones.columns and col_codigo_correccion in df_correcciones.columns:
-        bypass = df_correcciones[df_correcciones[col_texto].str.lower() == str(texto_cliente).lower().strip()]
-        if not bypass.empty:
-            return bypass.iloc[0][col_codigo_correccion]
-    else:
-        return "ERROR_COLUMNAS_CORRECCIONES"
-    
-    # 2. Extracción IA
+    # 2. Extracción IA (El core de la herramienta)
     datos = llamar_llm_gemini(texto_cliente)
     if not datos:
         return "ERROR_LLM"
@@ -101,23 +99,23 @@ def procesar_cotizacion(texto_cliente, df_precios, df_correcciones, df_marcas):
     producto = datos.get('producto', '')
     marca_solicitada = datos.get('marca', '')
     
-    # 3. Fallback en texto sucio
-    col_detalle = 'Detalle'
-    col_codigo = 'Código'
-    
-    if col_detalle in df_precios.columns and col_codigo in df_precios.columns:
-        candidatos = df_precios[df_precios[col_detalle].str.contains(str(producto), case=False, na=False)]
+    # 3. Fallback y búsqueda en Lista de Precios
+    try:
+        # Normalizamos también las columnas de precios para evitar errores
+        df_precios_temp = df_precios.copy()
+        df_precios_temp.columns = [str(c).lower().strip() for c in df_precios.columns]
         
-        # Validar la marca solo si no es nula/vacía
+        candidatos = df_precios_temp[df_precios_temp['detalle'].astype(str).str.contains(str(producto), case=False, na=False)]
+        
         if marca_solicitada and str(marca_solicitada).lower() != "null":
-            candidatos = candidatos[candidatos[col_detalle].str.contains(str(marca_solicitada), case=False, na=False)]
+            candidatos = candidatos[candidatos['detalle'].astype(str).str.contains(str(marca_solicitada), case=False, na=False)]
         
         if candidatos.empty:
             return "SIN_COINCIDENCIAS"
         
-        return candidatos.iloc[0][col_codigo]
-    else:
-        return "ERROR_COLUMNAS_PRECIOS"
+        return candidatos.iloc[0]['código']
+    except Exception:
+        return "ERROR_COLUMNAS_PRECIOS (Falta columna 'Detalle' o 'Código')"
 
 # --- Interfaz Visual y Ejecución Masiva ---
 try:
@@ -139,7 +137,6 @@ if archivo_cliente:
         else:
             df_cliente = pd.read_excel(archivo_cliente)
             
-        # Limpieza básica
         df_cliente = df_cliente.dropna(how='all')
         df_cliente.columns = df_cliente.columns.str.strip()
         
@@ -158,13 +155,11 @@ if archivo_cliente:
                 for index, row in df_cliente.iterrows():
                     texto_item = str(row[columna_texto])
                     
-                    # Ignorar celdas vacías
                     if texto_item.strip() == "" or texto_item.lower() == "nan":
                         resultados.append("FILA_VACIA")
                     else:
                         codigo = procesar_cotizacion(texto_item, df_precios, df_correcciones, df_marcas)
                         resultados.append(codigo)
-                        # Delay táctico obligatorio para el rate limit de Gemini
                         time.sleep(2) 
                     
                     progreso_actual = (index + 1) / total_filas
@@ -175,7 +170,6 @@ if archivo_cliente:
             st.success("Procesamiento finalizado.")
             st.dataframe(df_cliente)
             
-            # Buffer en memoria para la descarga
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 df_cliente.to_excel(writer, index=False, sheet_name='Cotización Procesada')
