@@ -54,8 +54,8 @@ def cargar_bases():
 def llamar_llm_gemini(texto_cliente):
     api_key = st.secrets["GEMINI_API_KEY"]
     
-    # Usamos el alias universal "gemini-pro" que no falla por versiones
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={api_key}"
+    # ACTUALIZADO 2026: Usamos la generación actual (gemini-2.5-flash)
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
     
     prompt = f"""
     Eres un extractor de datos técnicos de materiales eléctricos.
