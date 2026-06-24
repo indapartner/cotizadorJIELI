@@ -219,7 +219,7 @@ if archivo_cliente:
                         resultados_precio.append(precio)
                         
                         # --- PAUSA DE 5 SEGUNDOS (Límite 12 RPM para Google Free) ---
-                        time.sleep(10) 
+                        time.sleep(2) 
                     
                     progreso_actual = (index + 1) / total_filas
                     barra_progreso.progress(progreso_actual)
