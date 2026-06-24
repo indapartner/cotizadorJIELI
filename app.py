@@ -56,11 +56,14 @@ def llamar_llm_gemini(texto_cliente):
     
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
     
+    # NUEVO PROMPT: Obligamos a la IA a separar TODO en atributos para no romper la búsqueda
     prompt = f"""
-    Eres un extractor de datos técnicos de materiales eléctricos.
-    Analiza esta solicitud: '{texto_cliente}'
-    Devuelve ÚNICAMENTE un JSON con esta estructura y nada más:
-    {{"producto": "nombre generico", "atributos": ["atr1", "atr2"], "marca": "marca si existe o null"}}
+    Eres un experto en materiales eléctricos. Analiza esta solicitud: '{texto_cliente}'
+    Extrae la información y devuelve ÚNICAMENTE un JSON con esta estructura:
+    {{"producto": "palabra clave principal", "atributos": ["atr1", "atr2"], "marca": "marca si existe o null"}}
+    REGLA: El "producto" debe ser de 1 o 2 palabras (ej: cable, termica, cano). Todo lo demás (medidas, polos, colores) va a "atributos".
+    Ejemplo si es 'Termica 2x16 Sica': {{"producto": "termica", "atributos": ["2x16", "16A", "bipolar"], "marca": "Sica"}}
+    Ejemplo si es 'cable unipolar 4mm verde': {{"producto": "cable", "atributos": ["unipolar", "4mm", "verde"], "marca": "null"}}
     """
     
     payload = {
@@ -108,7 +111,7 @@ def procesar_cotizacion(texto_cliente, df_precios, df_correcciones, df_marcas):
     except Exception:
         pass
     
-    # 2. Extracción IA
+    # 2. Extracción IA y SISTEMA DE PUNTAJE
     if not codigo_final:
         datos = llamar_llm_gemini(texto_cliente)
         
@@ -119,18 +122,40 @@ def procesar_cotizacion(texto_cliente, df_precios, df_correcciones, df_marcas):
         else:
             producto = datos.get('producto', '')
             marca_solicitada = datos.get('marca', '')
+            atributos = datos.get('atributos', [])
             
             try:
                 df_precios_temp = df_precios.copy()
                 df_precios_temp.columns = [str(c).lower().strip() for c in df_precios.columns]
                 
-                candidatos = df_precios_temp[df_precios_temp['detalle'].astype(str).str.contains(str(producto), case=False, na=False)]
-                
-                if marca_solicitada and str(marca_solicitada).lower() != "null":
-                    candidatos = candidates = candidatos[candidatos['detalle'].astype(str).str.contains(str(marca_solicitada), case=False, na=False)]
+                # Filtro inicial: Buscamos solo la palabra raíz (ej: "cable")
+                prod_limpio = str(producto).lower().strip()
+                candidatos = df_precios_temp[df_precios_temp['detalle'].astype(str).str.contains(prod_limpio, case=False, na=False)].copy()
                 
                 if not candidatos.empty:
+                    # --- INICIO SISTEMA DE PUNTAJE ---
+                    candidatos['score'] = 0
+                    # Truco de magia: borramos los espacios de la lista de precios para que "4 mm" y "4mm" matcheen perfecto
+                    detalle_sin_espacios = candidatos['detalle'].astype(str).str.lower().str.replace(" ", "")
+                    
+                    # Chequeo de marca (Peso fuerte: suma 2 puntos)
+                    if marca_solicitada and str(marca_solicitada).lower() not in ["null", "none", ""]:
+                        marca_limpia = str(marca_solicitada).lower().replace(" ", "")
+                        candidatos['score'] += detalle_sin_espacios.str.contains(marca_limpia).astype(int) * 2
+                    
+                    # Chequeo de atributos (Suma 1 punto por cada coincidencia exacta sin espacios)
+                    if isinstance(atributos, list):
+                        for attr in atributos:
+                            if str(attr).strip():
+                                attr_limpio = str(attr).lower().replace(" ", "")
+                                candidatos['score'] += detalle_sin_espacios.str.contains(attr_limpio).astype(int)
+                    
+                    # Ordenamos por los que sacaron mejor nota
+                    candidatos = candidatos.sort_values(by='score', ascending=False)
+                    
+                    # Nos quedamos con el mejor (si hay empate en puntaje, queda el que Pandas filtró primero, que suele ser el más exacto)
                     codigo_final = candidatos.iloc[0]['código']
+                    # -----------------------------------
                 else:
                     error_msg = "SIN_COINCIDENCIAS"
             except Exception:
@@ -150,7 +175,6 @@ def procesar_cotizacion(texto_cliente, df_precios, df_correcciones, df_marcas):
                     
                     col_precio = next((c for c in cols_precios if 'precio' in c), None)
                     if col_precio:
-                        # Limpieza básica del valor de precio por si viene como string
                         val_precio = match.iloc[0][col_precio]
                         try:
                             precio_final = float(str(val_precio).replace('$', '').replace('.', '').replace(',', '.').strip())
@@ -198,12 +222,10 @@ if archivo_cliente:
         
         columnas_disponibles = df_cliente.columns.tolist()
         
-        # --- NUEVO: Los dos selectores independientes ---
         col1, col2 = st.columns(2)
         with col1:
             columna_texto = st.selectbox("Seleccioná la columna del DETALLE del material:", columnas_disponibles)
         with col2:
-            # Agregamos una opción por defecto si no quiere calcular cantidades
             opciones_cantidad = ["No calcular cantidad"] + columnas_disponibles
             columna_cantidad = st.selectbox("Seleccioná la columna de la CANTIDAD:", opciones_cantidad)
         
@@ -231,12 +253,10 @@ if archivo_cliente:
                         resultados_detalle.append(detalle)
                         resultados_precio.append(precio)
                         
-                        # --- NUEVO: Cálculo dinámico de Subtotal ---
                         if columna_cantidad != "No calcular cantidad":
                             try:
                                 cant_raw = row[columna_cantidad]
                                 cantidad = float(str(cant_raw).replace(',', '.').strip())
-                                # Si el precio es float válido, multiplicamos, sino va 0
                                 if isinstance(precio, (int, float)):
                                     resultados_subtotal.append(cantidad * precio)
                                 else:
@@ -251,7 +271,6 @@ if archivo_cliente:
                     progreso_actual = min((i + 1) / total_filas, 1.0)
                     barra_progreso.progress(progreso_actual)
             
-            # Guardamos las nuevas columnas mapeadas en el DataFrame final
             df_cliente['SKU_Asignado'] = resultados_sku
             df_cliente['Detalle_Lista_Oficial'] = resultados_detalle
             df_cliente['Precio_Unitario'] = resultados_precio
