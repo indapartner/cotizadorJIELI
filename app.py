@@ -30,7 +30,11 @@ def descargar_excel(_drive_service, file_id):
     while not done:
         _, done = downloader.next_chunk()
     file_stream.seek(0)
-    return pd.read_excel(file_stream)
+    
+    df = pd.read_excel(file_stream)
+    # Blindaje contra espacios invisibles en las columnas
+    df.columns = df.columns.str.strip() 
+    return df
 
 @st.cache_data(ttl=3600)
 def cargar_bases():
@@ -67,7 +71,7 @@ def llamar_llm_gemini(texto_cliente):
 
 def procesar_cotizacion(texto_cliente, df_precios, df_correcciones, df_marcas):
     # 1. Bypass determinista
-    bypass = df_correcciones[df_correcciones['Texto Cliente'].str.lower() == str(texto_cliente).lower()]
+    bypass = df_correcciones[df_correcciones['Texto Cliente'].str.lower() == str(texto_cliente).lower().strip()]
     if not bypass.empty:
         return bypass.iloc[0]['Codigo Oficial JIELI']
     
@@ -110,6 +114,8 @@ if archivo_cliente:
     
     # Limpieza básica
     df_cliente = df_cliente.dropna(how='all')
+    # Normalizar las columnas del archivo subido también por seguridad
+    df_cliente.columns = df_cliente.columns.str.strip()
     
     st.write("Vista previa del archivo:")
     st.dataframe(df_cliente.head(3))
