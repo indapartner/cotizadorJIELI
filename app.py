@@ -5,6 +5,7 @@ import requests
 import io
 import time
 import re
+import concurrent.futures
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
@@ -69,13 +70,13 @@ def llamar_llm_juez(texto_cliente, lista_candidatos):
     Eres el jefe de ventas de una casa de materiales eléctricos.
     Un cliente te pidió cotizar exactamente esto: "{texto_cliente}"
     
-    Tu asistente buscó en el sistema y te trajo una pre-selección con estos posibles productos de la lista de precios oficial:
+    Tu asistente buscó en el sistema y te trajo una pre-selección con estos posibles productos de la lista oficial:
     {json.dumps(lista_candidatos, indent=2, ensure_ascii=False)}
     
     Tu tarea:
     1. Analizar semánticamente el pedido del cliente (ej: "térmica" = "termomagnética", "4mm" = "4.00 mm", "cable" = "conductor").
     2. Leer la pre-selección y elegir el producto que cumple EXACTAMENTE con lo pedido.
-    3. Si ninguna de las opciones sirve, o le falta un dato clave (ej: pide 4mm y solo hay de 2.5mm), debes rechazarlo.
+    3. Si ninguna de las opciones sirve, debes rechazarlo.
     
     Devuelve ÚNICAMENTE un JSON con esta estructura:
     {{"codigo_elegido": "el código alfanumérico del producto ganador, o la palabra 'SIN_COINCIDENCIAS'", "razonamiento": "por qué lo elegiste en 10 palabras"}}
@@ -87,7 +88,8 @@ def llamar_llm_juez(texto_cliente, lista_candidatos):
     }
     
     try:
-        response = requests.post(url, json=payload)
+        # Le ponemos un timeout corto por si Google se cuelga, así no frena el resto
+        response = requests.post(url, json=payload, timeout=15)
         if response.status_code != 200:
             return {"error": f"Error API {response.status_code}"}
             
@@ -103,7 +105,6 @@ def llamar_llm_juez(texto_cliente, lista_candidatos):
         return {"error": str(e)}
 
 def procesar_cotizacion(texto_cliente, df_precios, df_correcciones):
-    # 1. Bypass (Correcciones manuales)
     try:
         cols_corr = [str(c).lower().strip() for c in df_correcciones.columns]
         if 'texto cliente' in cols_corr and 'codigo oficial jieli' in cols_corr:
@@ -116,8 +117,6 @@ def procesar_cotizacion(texto_cliente, df_precios, df_correcciones):
     except Exception:
         pass
 
-    # 2. Búsqueda Previa (Shortlist) para la IA
-    # Identificamos las columnas dinámicamente
     col_codigo = next((c for c in df_precios.columns if 'código' in str(c).lower() or 'codigo' in str(c).lower()), None)
     col_detalle = next((c for c in df_precios.columns if 'detalle' in str(c).lower()), None)
     
@@ -128,31 +127,23 @@ def procesar_cotizacion(texto_cliente, df_precios, df_correcciones):
     df_temp['detalle_norm'] = df_temp[col_detalle].apply(normalizar_texto)
     texto_norm = normalizar_texto(texto_cliente)
     
-    # Extraemos palabras mayores a 1 letra para buscar (ej: "cable", "unipolar", "4mm", "verde")
     palabras = [p for p in texto_norm.split() if len(p) > 1]
-    
-    # Sumamos 1 punto por cada palabra que aparezca en el detalle del producto
     df_temp['score'] = 0
     for palabra in palabras:
         df_temp['score'] += df_temp['detalle_norm'].str.contains(re.escape(palabra), case=False, regex=True).astype(int)
     
-    # Nos quedamos con los 20 productos que más palabras compartan con el texto del cliente
     candidatos_top = df_temp[df_temp['score'] > 0].sort_values(by='score', ascending=False).head(20)
     
     if candidatos_top.empty:
         return "SIN_COINCIDENCIAS", "NO_ENCONTRADO", 0.0
 
-    # Armamos la lista para enviarle a la IA
     lista_para_ia = candidatos_top[[col_codigo, col_detalle]].rename(columns={col_codigo: "codigo", col_detalle: "detalle"}).to_dict(orient='records')
-
-    # 3. La IA toma la decisión final leyendo el catálogo
     respuesta_ia = llamar_llm_juez(texto_cliente, lista_para_ia)
     
     if isinstance(respuesta_ia, dict) and "error" in respuesta_ia:
         return f"ERROR_LLM: {respuesta_ia['error']}", "-", 0.0
         
     codigo_ganador = respuesta_ia.get('codigo_elegido', 'SIN_COINCIDENCIAS')
-    
     if codigo_ganador == 'SIN_COINCIDENCIAS':
         return "SIN_COINCIDENCIAS", "NO_ENCONTRADO", 0.0
         
@@ -183,6 +174,27 @@ def obtener_datos_por_codigo(codigo, df_precios):
         return codigo, detalle, precio
     else:
         return codigo, "CÓDIGO_NO_EN_LISTA", 0.0
+
+# --- Worker para el Paralelismo ---
+def procesar_fila_worker(args):
+    i, texto_item, cant_raw, calc_cant, df_p, df_c = args
+    if texto_item.strip() == "" or texto_item.lower() == "nan":
+        return i, "FILA_VACIA", "-", 0.0, 0.0
+        
+    codigo, detalle, precio = procesar_cotizacion(texto_item, df_p, df_c)
+    
+    subtotal = "-"
+    if calc_cant:
+        try:
+            cantidad = float(str(cant_raw).replace(',', '.').strip())
+            if isinstance(precio, (int, float)):
+                subtotal = cantidad * precio
+            else:
+                subtotal = 0.0
+        except:
+            subtotal = "CANT_INVALIDA"
+            
+    return i, codigo, detalle, precio, subtotal
 
 # --- Interfaz Visual ---
 try:
@@ -219,49 +231,49 @@ if archivo_cliente:
             columna_cantidad = st.selectbox("Seleccioná la columna de la CANTIDAD:", opciones_cantidad)
         
         if st.button("Procesar Cotización Completa", type="primary"):
-            resultados_sku, resultados_detalle, resultados_precio, resultados_subtotal = [], [], [], []
-            barra_progreso = st.progress(0.0)
             total_filas = len(df_cliente)
             
-            with st.spinner("La IA está leyendo y comparando el catálogo..."):
-                for i, (index, row) in enumerate(df_cliente.iterrows()):
-                    texto_item = str(row[columna_texto])
-                    
-                    if texto_item.strip() == "" or texto_item.lower() == "nan":
-                        resultados_sku.append("FILA_VACIA")
-                        resultados_detalle.append("-")
-                        resultados_precio.append(0.0)
-                        resultados_subtotal.append(0.0)
-                    else:
-                        codigo, detalle, precio = procesar_cotizacion(texto_item, df_precios, df_correcciones)
-                        resultados_sku.append(codigo)
-                        resultados_detalle.append(detalle)
-                        resultados_precio.append(precio)
-                        
-                        if columna_cantidad != "No calcular cantidad":
-                            try:
-                                cant_raw = row[columna_cantidad]
-                                cantidad = float(str(cant_raw).replace(',', '.').strip())
-                                if isinstance(precio, (int, float)):
-                                    resultados_subtotal.append(cantidad * precio)
-                                else:
-                                    resultados_subtotal.append(0.0)
-                            except:
-                                resultados_subtotal.append("CANT_INVALIDA")
-                        else:
-                            resultados_subtotal.append("-")
-                    
-                    progreso_actual = min((i + 1) / total_filas, 1.0)
-                    barra_progreso.progress(progreso_actual)
+            # Pre-armamos las listas vacías para mantener el orden original
+            resultados_sku = [""] * total_filas
+            resultados_detalle = [""] * total_filas
+            resultados_precio = [0.0] * total_filas
+            resultados_subtotal = [0.0] * total_filas
             
+            # Preparamos las tareas para los "empleados"
+            calc_cant = (columna_cantidad != "No calcular cantidad")
+            tareas = []
+            for i, (index, row) in enumerate(df_cliente.iterrows()):
+                texto = str(row[columna_texto])
+                cant = row[columna_cantidad] if calc_cant else None
+                tareas.append((i, texto, cant, calc_cant, df_precios, df_correcciones))
+            
+            barra_progreso = st.progress(0.0)
+            
+            with st.spinner("La IA está analizando en MODO TURBO (Procesando filas en paralelo)..."):
+                completados = 0
+                
+                # Desatamos 15 hilos en simultáneo a pegarle a la API
+                with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+                    futuros = [executor.submit(procesar_fila_worker, t) for t in tareas]
+                    
+                    for futuro in concurrent.futures.as_completed(futuros):
+                        i, cod, det, pre, sub = futuro.result()
+                        resultados_sku[i] = cod
+                        resultados_detalle[i] = det
+                        resultados_precio[i] = pre
+                        resultados_subtotal[i] = sub
+                        
+                        completados += 1
+                        barra_progreso.progress(min(completados / total_filas, 1.0))
+            
+            # Asignamos las columnas resultantes
             df_cliente['SKU_Asignado'] = resultados_sku
             df_cliente['Detalle_Lista_Oficial'] = resultados_detalle
             df_cliente['Precio_Unitario'] = resultados_precio
-            
-            if columna_cantidad != "No calcular cantidad":
+            if calc_cant:
                 df_cliente['Subtotal_Calculado'] = resultados_subtotal
             
-            st.success("Procesamiento finalizado.")
+            st.success("Procesamiento finalizado a velocidad máxima.")
             st.dataframe(df_cliente)
             
             output = io.BytesIO()
