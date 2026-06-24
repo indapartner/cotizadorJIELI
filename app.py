@@ -53,7 +53,7 @@ def cargar_bases():
 # --- Lógica de IA y Procesamiento ---
 def llamar_llm_gemini(texto_cliente):
     api_key = st.secrets["GEMINI_API_KEY"]
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={api_key}"
     
     prompt = f"""
     Eres un extractor de datos técnicos de materiales eléctricos.
