@@ -54,7 +54,6 @@ def cargar_bases():
 def llamar_llm_gemini(texto_cliente):
     api_key = st.secrets["GEMINI_API_KEY"]
     
-    # Usamos la generación actual
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
     
     prompt = f"""
@@ -96,7 +95,7 @@ def procesar_cotizacion(texto_cliente, df_precios, df_correcciones, df_marcas):
     precio_final = 0.0
     error_msg = None
 
-    # 1. Bypass determinista (Opcional - Tolerante a fallos)
+    # 1. Bypass determinista
     try:
         cols_corr = [str(c).lower().strip() for c in df_correcciones.columns]
         if 'texto cliente' in cols_corr and 'codigo oficial jieli' in cols_corr:
@@ -109,7 +108,7 @@ def procesar_cotizacion(texto_cliente, df_precios, df_correcciones, df_marcas):
     except Exception:
         pass
     
-    # 2. Extracción IA y Búsqueda de Código (Si no hubo bypass)
+    # 2. Extracción IA
     if not codigo_final:
         datos = llamar_llm_gemini(texto_cliente)
         
@@ -128,7 +127,7 @@ def procesar_cotizacion(texto_cliente, df_precios, df_correcciones, df_marcas):
                 candidatos = df_precios_temp[df_precios_temp['detalle'].astype(str).str.contains(str(producto), case=False, na=False)]
                 
                 if marca_solicitada and str(marca_solicitada).lower() != "null":
-                    candidatos = candidatos[candidatos['detalle'].astype(str).str.contains(str(marca_solicitada), case=False, na=False)]
+                    candidatos = candidates = candidatos[candidatos['detalle'].astype(str).str.contains(str(marca_solicitada), case=False, na=False)]
                 
                 if not candidatos.empty:
                     codigo_final = candidatos.iloc[0]['código']
@@ -137,7 +136,7 @@ def procesar_cotizacion(texto_cliente, df_precios, df_correcciones, df_marcas):
             except Exception:
                 error_msg = "ERROR_COLUMNAS_PRECIOS"
 
-    # 3. Traer Detalle y Precio desde la base usando el Código Final
+    # 3. Traer Detalle y Precio
     if codigo_final and not error_msg:
         try:
             df_precios_temp = df_precios.copy()
@@ -149,21 +148,25 @@ def procesar_cotizacion(texto_cliente, df_precios, df_correcciones, df_marcas):
                 if not match.empty:
                     detalle_final = match.iloc[0]['detalle'] if 'detalle' in cols_precios else "Sin columna 'Detalle'"
                     
-                    # Busca dinámicamente cualquier columna que contenga "precio"
                     col_precio = next((c for c in cols_precios if 'precio' in c), None)
                     if col_precio:
-                        precio_final = match.iloc[0][col_precio]
+                        # Limpieza básica del valor de precio por si viene como string
+                        val_precio = match.iloc[0][col_precio]
+                        try:
+                            precio_final = float(str(val_precio).replace('$', '').replace('.', '').replace(',', '.').strip())
+                        except:
+                            precio_final = val_precio
                     else:
-                        precio_final = "Sin columna 'Precio'"
+                        precio_final = 0.0
                 else:
                     detalle_final = "CÓDIGO_NO_EN_LISTA"
-                    precio_final = "-"
+                    precio_final = 0.0
         except Exception:
             detalle_final = "ERROR_BUSQUEDA_DATOS"
-            precio_final = "ERROR"
+            precio_final = 0.0
 
     if error_msg:
-        return error_msg, "-", "-"
+        return error_msg, "-", 0.0
         
     return codigo_final, detalle_final, precio_final
 
@@ -194,40 +197,67 @@ if archivo_cliente:
         st.dataframe(df_cliente.head(3))
         
         columnas_disponibles = df_cliente.columns.tolist()
-        columna_texto = st.selectbox("Seleccioná qué columna contiene el detalle del material:", columnas_disponibles)
+        
+        # --- NUEVO: Los dos selectores independientes ---
+        col1, col2 = st.columns(2)
+        with col1:
+            columna_texto = st.selectbox("Seleccioná la columna del DETALLE del material:", columnas_disponibles)
+        with col2:
+            # Agregamos una opción por defecto si no quiere calcular cantidades
+            opciones_cantidad = ["No calcular cantidad"] + columnas_disponibles
+            columna_cantidad = st.selectbox("Seleccioná la columna de la CANTIDAD:", opciones_cantidad)
         
         if st.button("Procesar Cotización Completa", type="primary"):
             resultados_sku = []
             resultados_detalle = []
             resultados_precio = []
+            resultados_subtotal = []
             
-            barra_progreso = st.progress(0)
+            barra_progreso = st.progress(0.0)
             total_filas = len(df_cliente)
             
             with st.spinner("Procesando matriz fila por fila..."):
-                for index, row in df_cliente.iterrows():
+                for i, (index, row) in enumerate(df_cliente.iterrows()):
                     texto_item = str(row[columna_texto])
                     
                     if texto_item.strip() == "" or texto_item.lower() == "nan":
                         resultados_sku.append("FILA_VACIA")
                         resultados_detalle.append("-")
-                        resultados_precio.append("-")
+                        resultados_precio.append(0.0)
+                        resultados_subtotal.append(0.0)
                     else:
                         codigo, detalle, precio = procesar_cotizacion(texto_item, df_precios, df_correcciones, df_marcas)
                         resultados_sku.append(codigo)
                         resultados_detalle.append(detalle)
                         resultados_precio.append(precio)
                         
-                        # --- PAUSA DE 5 SEGUNDOS (Límite 12 RPM para Google Free) ---
+                        # --- NUEVO: Cálculo dinámico de Subtotal ---
+                        if columna_cantidad != "No calcular cantidad":
+                            try:
+                                cant_raw = row[columna_cantidad]
+                                cantidad = float(str(cant_raw).replace(',', '.').strip())
+                                # Si el precio es float válido, multiplicamos, sino va 0
+                                if isinstance(precio, (int, float)):
+                                    resultados_subtotal.append(cantidad * precio)
+                                else:
+                                    resultados_subtotal.append(0.0)
+                            except:
+                                resultados_subtotal.append("CANT_INVALIDA")
+                        else:
+                            resultados_subtotal.append("-")
+                            
                         time.sleep(0.1) 
                     
-                    progreso_actual = (index + 1) / total_filas
+                    progreso_actual = min((i + 1) / total_filas, 1.0)
                     barra_progreso.progress(progreso_actual)
             
-            # Agregamos las tres columnas al Excel final
+            # Guardamos las nuevas columnas mapeadas en el DataFrame final
             df_cliente['SKU_Asignado'] = resultados_sku
             df_cliente['Detalle_Lista_Oficial'] = resultados_detalle
             df_cliente['Precio_Unitario'] = resultados_precio
+            
+            if columna_cantidad != "No calcular cantidad":
+                df_cliente['Subtotal_Calculado'] = resultados_subtotal
             
             st.success("Procesamiento finalizado.")
             st.dataframe(df_cliente)
@@ -243,4 +273,4 @@ if archivo_cliente:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
     except Exception as e:
-        st.error(f"Error al leer el archivo del cliente: {e}")
+        st.error(f"Error al procesar el archivo: {e}")
