@@ -58,7 +58,7 @@ def llamar_llm_gemini(texto_cliente):
     prompt = f"""
     Eres un extractor de datos técnicos de materiales eléctricos.
     Analiza esta solicitud: '{texto_cliente}'
-    Devuelve ÚNICAMENTE un JSON con esta estructura:
+    Devuelve ÚNICAMENTE un JSON con esta estructura y nada más:
     {{"producto": "nombre generico", "atributos": ["atr1", "atr2"], "marca": "marca si existe o null"}}
     """
     
@@ -69,16 +69,32 @@ def llamar_llm_gemini(texto_cliente):
     
     try:
         response = requests.post(url, json=payload)
-        if response.status_code == 200:
-            return json.loads(response.json()['candidates'][0]['content']['parts'][0]['text'])
+        
+        # 1. Chequeamos si Google nos rebotó la conexión (ej. API key mala, Rate limit)
+        if response.status_code != 200:
+            return {"error": f"Error API {response.status_code}: {response.text[:100]}"}
+            
+        data = response.json()
+        
+        # 2. Chequeamos si la IA bloqueó el texto por algún filtro de seguridad
+        if 'candidates' not in data or len(data['candidates']) == 0:
+            return {"error": "Respuesta vacía o bloqueada por Gemini"}
+            
+        texto_respuesta = data['candidates'][0]['content']['parts'][0]['text']
+        
+        # 3. Limpiamos cualquier formato markdown ("```json ... ```") que a veces mete la IA
+        texto_respuesta = texto_respuesta.strip().removeprefix("```json").removesuffix("```").strip()
+        
+        return json.loads(texto_respuesta)
+        
+    except json.JSONDecodeError:
+        return {"error": f"La IA no devolvió un JSON válido. Devolvió: {texto_respuesta[:50]}"}
     except Exception as e:
-        return None
-    return None
+        return {"error": f"Falla interna: {str(e)}"}
 
 def procesar_cotizacion(texto_cliente, df_precios, df_correcciones, df_marcas):
     # 1. Bypass determinista (Opcional - Tolerante a fallos)
     try:
-        # Pasamos las columnas a minúsculas para evitar errores de tipeo en el Drive
         cols_corr = [str(c).lower().strip() for c in df_correcciones.columns]
         if 'texto cliente' in cols_corr and 'codigo oficial jieli' in cols_corr:
             df_corr_temp = df_correcciones.copy()
@@ -88,20 +104,22 @@ def procesar_cotizacion(texto_cliente, df_precios, df_correcciones, df_marcas):
             if not bypass.empty:
                 return bypass.iloc[0]['codigo oficial jieli']
     except Exception:
-        # Si las columnas no existen o el archivo falla, no hacemos nada y pasamos a la IA.
         pass
     
-    # 2. Extracción IA (El core de la herramienta)
+    # 2. Extracción IA
     datos = llamar_llm_gemini(texto_cliente)
-    if not datos:
-        return "ERROR_LLM"
+    
+    # Si la IA devolvió un error, lo pasamos directo para verlo en el archivo
+    if isinstance(datos, dict) and "error" in datos:
+        return datos["error"]
+    elif not datos:
+        return "ERROR_LLM_DESCONOCIDO"
     
     producto = datos.get('producto', '')
     marca_solicitada = datos.get('marca', '')
     
     # 3. Fallback y búsqueda en Lista de Precios
     try:
-        # Normalizamos también las columnas de precios para evitar errores
         df_precios_temp = df_precios.copy()
         df_precios_temp.columns = [str(c).lower().strip() for c in df_precios.columns]
         
@@ -115,7 +133,7 @@ def procesar_cotizacion(texto_cliente, df_precios, df_correcciones, df_marcas):
         
         return candidatos.iloc[0]['código']
     except Exception:
-        return "ERROR_COLUMNAS_PRECIOS (Falta columna 'Detalle' o 'Código')"
+        return "ERROR_COLUMNAS_PRECIOS"
 
 # --- Interfaz Visual y Ejecución Masiva ---
 try:
